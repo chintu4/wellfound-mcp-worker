@@ -4,3 +4,7 @@ compatibility_date = "2026-11-17"
 
 [vars]
 WELLFOUND_BASE_URL = "https://wellfound.com"
+
+[[kv_namespaces]]
+binding = "OAUTH_KV"
+id = "1a46b87de8754e50ba740a5c9b205f18"
