@@ -1,8 +1,8 @@
-// Wellfound Jobs Cloudflare Worker MCP Server
+// Wellfound Jobs Cloudflare Worker MCP Server (Read + Write Operations)
 // Supports MCP Protocol (2024-11-05): initialize, ping, notifications/initialized, tools/list, tools/call
 // Authentication:
 //   1. Client -> MCP Worker: Authorization: Bearer <MCP_AUTH_TOKEN> or X-API-Key
-//   2. MCP Worker -> Wellfound: Authenticated _wellfound cookie + X-CSRF-Token (GraphQL) with SSR state fallback
+//   2. MCP Worker -> Wellfound: Authenticated _wellfound cookie + X-CSRF-Token (GraphQL mutations & queries)
 
 export interface Env {
   WELLFOUND_BASE_URL?: string;
@@ -52,13 +52,13 @@ const WELLFOUND_TOOLS = [
   {
     name: 'get_wellfound_job_details',
     description:
-      'Retrieve full details for a specific Wellfound job listing including compensation, equity, full description, and company metadata.',
+      'Retrieve full details for a specific Wellfound job listing including job ID, compensation, equity, full description, and screening questions.',
     inputSchema: {
       type: 'object',
       properties: {
         job_slug: {
           type: 'string',
-          description: 'Wellfound job slug or full job URL (e.g., "4791894-senior-ai-developer" or "https://wellfound.com/jobs/...")',
+          description: 'Wellfound job slug or full job URL (e.g., "4791894-senior-ai-developer")',
         },
       },
       required: ['job_slug'],
@@ -89,6 +89,102 @@ const WELLFOUND_TOOLS = [
         page: {
           type: 'number',
           description: '1-based page number (default: 1)',
+        },
+      },
+    },
+  },
+  {
+    name: 'apply_to_wellfound_job',
+    description:
+      'WRITE OPERATION: Submit a job application on Wellfound with a custom cover note/pitch to the hiring manager. Supports dry_run=true to preview before sending (applications cannot be undone once submitted).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        job_id: {
+          type: 'string',
+          description: 'Numeric Wellfound job listing ID (e.g., "4791894"). You can also pass job_slug to auto-resolve the ID.',
+        },
+        job_slug: {
+          type: 'string',
+          description: 'Optional job slug if job_id is unknown; the server will resolve the numeric job_id first.',
+        },
+        note: {
+          type: 'string',
+          description: 'Personalized application note / cover message sent directly to the recruiter/founder.',
+        },
+        answers: {
+          type: 'array',
+          description: 'Optional screening question answers [{ questionId, answer }] if the job requires them.',
+          items: {
+            type: 'object',
+            properties: {
+              questionId: { type: 'string' },
+              answer: { type: 'string' },
+            },
+            required: ['questionId', 'answer'],
+          },
+        },
+        dry_run: {
+          type: 'boolean',
+          description: 'If true, validates authentication and previews the application payload without submitting (default: false).',
+        },
+      },
+      required: ['note'],
+    },
+  },
+  {
+    name: 'save_wellfound_job',
+    description:
+      'WRITE OPERATION: Bookmark/save or unsave a job listing on Wellfound for later review.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        job_id: {
+          type: 'string',
+          description: 'Numeric Wellfound job listing ID (e.g., "4791894")',
+        },
+        saved: {
+          type: 'boolean',
+          description: 'true to save/bookmark the job, false to unsave it (default: true)',
+        },
+      },
+      required: ['job_id'],
+    },
+  },
+  {
+    name: 'send_wellfound_message',
+    description:
+      'WRITE OPERATION: Send a follow-up message inside an existing Wellfound application/recruiter conversation thread.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        thread_id: {
+          type: 'string',
+          description: 'Wellfound conversation / application thread ID from list_wellfound_applications',
+        },
+        body: {
+          type: 'string',
+          description: 'Message text to send to the recruiter or founder',
+        },
+      },
+      required: ['thread_id', 'body'],
+    },
+  },
+  {
+    name: 'update_wellfound_profile_headline',
+    description:
+      'WRITE OPERATION: Update your Wellfound candidate bio/headline or job-search status.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        headline: {
+          type: 'string',
+          description: 'New profile headline / mini-bio (max 160 chars recommended)',
+        },
+        job_search_status: {
+          type: 'string',
+          enum: ['ACTIVE', 'OPEN', 'CLOSED'],
+          description: 'Candidate availability status: ACTIVE (ready to interview), OPEN (open to offers), CLOSED',
         },
       },
     },
@@ -158,6 +254,42 @@ class WellfoundClient {
       }
     }
     return headers;
+  }
+
+  private async executeGraphQL(operationName: string, query: string, variables: Record<string, any>) {
+    if (!this.isAuthenticated()) {
+      return {
+        ok: false,
+        status: 401,
+        error: 'WELLFOUND_SESSION_COOKIE is missing. Configure it in Cloudflare Worker secrets to execute write mutations.',
+      };
+    }
+
+    const res = await fetch(`${this.baseUrl}/graphql`, {
+      method: 'POST',
+      headers: this.buildHeaders(true),
+      body: JSON.stringify({ operationName, query, variables }),
+    });
+
+    const rawText = await res.text();
+    let parsed: any = null;
+    try {
+      parsed = JSON.parse(rawText);
+    } catch {
+      parsed = { raw: rawText.slice(0, 500) };
+    }
+
+    return {
+      ok: res.ok && !parsed?.errors,
+      status: res.status,
+      data: parsed?.data || null,
+      errors: parsed?.errors || null,
+      raw: !parsed?.data && !parsed?.errors ? parsed : undefined,
+      hint:
+        res.status === 403
+          ? 'Blocked by Wellfound DataDome/CSRF check. Ensure WELLFOUND_SESSION_COOKIE and WELLFOUND_CSRF_TOKEN are fresh from an active browser session.'
+          : undefined,
+    };
   }
 
   private extractEmbeddedState(html: string): any {
@@ -241,45 +373,34 @@ class WellfoundClient {
     const targetUrl = this.buildBrowseUrl(args);
 
     if (this.isAuthenticated() && this.csrfToken) {
-      try {
-        const gqlRes = await fetch(`${this.baseUrl}/graphql`, {
-          method: 'POST',
-          headers: this.buildHeaders(true),
-          body: JSON.stringify({
-            operationName: 'JobSearch',
-            variables: {
-              page: Number(args.page) || 1,
-              roleSlug: args.role_slug || null,
-              locationSlug: args.location_slug || null,
-              remote: typeof args.remote === 'boolean' ? args.remote : null,
-              jobTypes: args.job_type ? [args.job_type] : null,
-            },
-            query: `query JobSearch($page: Int, $roleSlug: String, $locationSlug: String, $remote: Boolean, $jobTypes: [String]) {
-              jobListings(page: $page, roleSlug: $roleSlug, locationSlug: $locationSlug, remote: $remote, jobTypes: $jobTypes) {
-                totalCount
-                edges {
-                  node {
-                    id slug title compensation equity remote jobType locationNames liveStartAt
-                    startup { id name slug highConcept companySize }
-                  }
-                }
+      const gql = await this.executeGraphQL(
+        'JobSearch',
+        `query JobSearch($page: Int, $roleSlug: String, $locationSlug: String, $remote: Boolean, $jobTypes: [String]) {
+          jobListings(page: $page, roleSlug: $roleSlug, locationSlug: $locationSlug, remote: $remote, jobTypes: $jobTypes) {
+            totalCount
+            edges {
+              node {
+                id slug title compensation equity remote jobType locationNames liveStartAt
+                startup { id name slug highConcept companySize }
               }
-            }`,
-          }),
-        });
-
-        if (gqlRes.ok) {
-          const gqlJson: any = await gqlRes.json();
-          if (gqlJson?.data?.jobListings) {
-            return {
-              source: 'wellfound-graphql-authenticated',
-              queryUrl: targetUrl,
-              data: gqlJson.data.jobListings,
-            };
+            }
           }
+        }`,
+        {
+          page: Number(args.page) || 1,
+          roleSlug: args.role_slug || null,
+          locationSlug: args.location_slug || null,
+          remote: typeof args.remote === 'boolean' ? args.remote : null,
+          jobTypes: args.job_type ? [args.job_type] : null,
         }
-      } catch {
-        // Fall through to SSR fetch
+      );
+
+      if (gql.ok && gql.data?.jobListings) {
+        return {
+          source: 'wellfound-graphql-authenticated',
+          queryUrl: targetUrl,
+          data: gql.data.jobListings,
+        };
       }
     }
 
@@ -302,10 +423,6 @@ class WellfoundClient {
       queryUrl: targetUrl,
       totalFound: jobs.length,
       jobs,
-      note:
-        jobs.length === 0 && res.status !== 200
-          ? 'Wellfound returned a bot/session challenge. Provide fresh WELLFOUND_SESSION_COOKIE and WELLFOUND_CSRF_TOKEN secrets.'
-          : undefined,
     };
   }
 
@@ -327,7 +444,7 @@ class WellfoundClient {
       url: targetUrl,
       job: detailedEntry
         ? {
-            id: detailedEntry.id,
+            id: detailedEntry.id || cleanSlug.split('-')[0],
             slug: detailedEntry.slug || cleanSlug,
             title: detailedEntry.title,
             description: detailedEntry.description || detailedEntry.descriptionHtml || null,
@@ -339,7 +456,7 @@ class WellfoundClient {
             skills: detailedEntry.skills || [],
             screeningQuestions: detailedEntry.screeningQuestions || [],
           }
-        : jobs[0] || null,
+        : jobs[0] || { id: cleanSlug.split('-')[0], slug: cleanSlug },
     };
   }
 
@@ -382,7 +499,6 @@ class WellfoundClient {
       return {
         authenticated: false,
         error: 'WELLFOUND_SESSION_COOKIE is not configured in Cloudflare Worker secrets.',
-        instructions: 'Log into wellfound.com in your browser, copy the _wellfound cookie, and set it via `wrangler secret put WELLFOUND_SESSION_COOKIE`.',
       };
     }
 
@@ -404,6 +520,116 @@ class WellfoundClient {
       applications,
     };
   }
+
+  // --- WRITE OPERATIONS ---
+
+  async applyToJob(args: { job_id?: string; job_slug?: string; note: string; answers?: any[]; dry_run?: boolean }) {
+    let jobId = (args.job_id || '').trim();
+    if (!jobId && args.job_slug) {
+      const slugPrefix = String(args.job_slug).replace(/^https?:\/\/wellfound\.com\/jobs\//, '').split('-')[0];
+      if (/^\d+$/.test(slugPrefix)) {
+        jobId = slugPrefix;
+      } else {
+        const details = await this.getJobDetails(args.job_slug);
+        jobId = String(details?.job?.id || '');
+      }
+    }
+
+    if (!jobId) {
+      throw new Error('Provide either a numeric job_id or a valid job_slug.');
+    }
+
+    const variables = {
+      input: {
+        jobListingId: jobId,
+        note: args.note,
+        questionAnswers: args.answers || [],
+      },
+    };
+
+    if (args.dry_run) {
+      return {
+        dryRun: true,
+        authenticated: this.isAuthenticated(),
+        csrfConfigured: Boolean(this.csrfToken),
+        endpoint: `${this.baseUrl}/graphql`,
+        operationName: 'CreateJobApplication',
+        payloadPreview: variables,
+      };
+    }
+
+    const mutation = `mutation CreateJobApplication($input: CreateJobApplicationInput!) {
+      createJobApplication(input: $input) {
+        jobApplication {
+          id
+          state
+          createdAt
+          note
+        }
+        errors {
+          field
+          message
+        }
+      }
+    }`;
+
+    return this.executeGraphQL('CreateJobApplication', mutation, variables);
+  }
+
+  async saveJob(jobId: string, saved = true) {
+    const mutation = saved
+      ? `mutation SaveJobListing($input: SaveJobListingInput!) {
+          saveJobListing(input: $input) {
+            jobListing { id isSaved }
+          }
+        }`
+      : `mutation UnsaveJobListing($input: UnsaveJobListingInput!) {
+          unsaveJobListing(input: $input) {
+            jobListing { id isSaved }
+          }
+        }`;
+
+    return this.executeGraphQL(saved ? 'SaveJobListing' : 'UnsaveJobListing', mutation, {
+      input: { jobListingId: String(jobId) },
+    });
+  }
+
+  async sendMessage(threadId: string, body: string) {
+    const mutation = `mutation SendApplicationMessage($input: SendApplicationMessageInput!) {
+      sendApplicationMessage(input: $input) {
+        message {
+          id
+          body
+          createdAt
+        }
+      }
+    }`;
+
+    return this.executeGraphQL('SendApplicationMessage', mutation, {
+      input: {
+        threadId: String(threadId),
+        body,
+      },
+    });
+  }
+
+  async updateProfileHeadline(args: { headline?: string; job_search_status?: string }) {
+    const input: Record<string, any> = {};
+    if (args.headline !== undefined) input.bio = args.headline;
+    if (args.job_search_status !== undefined) input.jobSearchStatus = args.job_search_status;
+
+    const mutation = `mutation UpdateCandidateProfile($input: UpdateCandidateProfileInput!) {
+      updateCandidateProfile(input: $input) {
+        talentProfile {
+          id
+          bio
+          jobSearchStatus
+        }
+      }
+    }`;
+
+    return this.executeGraphQL('UpdateCandidateProfile', mutation, { input });
+  }
 }
 
 export default {
@@ -418,14 +644,15 @@ export default {
         {
           status: 'ok',
           service: 'wellfound-mcp-worker',
+          version: '1.1.0',
           mcpAuthEnabled: Boolean((env.MCP_AUTH_TOKEN || '').trim()),
           wellfoundSessionConfigured: Boolean((env.WELLFOUND_SESSION_COOKIE || '').trim()),
+          wellfoundCsrfConfigured: Boolean((env.WELLFOUND_CSRF_TOKEN || '').trim()),
         },
         { headers: CORS_HEADERS }
       );
     }
 
-    // Enforce Bearer / X-API-Key authentication on MCP endpoints
     const authCheck = AuthGuard.verify(request, env);
     if (!authCheck.authorized) {
       return Response.json(
@@ -446,16 +673,16 @@ export default {
 
     const client = new WellfoundClient(env);
 
-    // Discovery / Status GET endpoint
     if (request.method === 'GET') {
       return Response.json(
         {
           name: 'wellfound-mcp-worker',
-          version: '1.0.0',
+          version: '1.1.0',
           protocol: 'json-rpc',
           auth: {
             mcpTokenProtected: Boolean((env.MCP_AUTH_TOKEN || '').trim()),
             wellfoundSessionAuthenticated: client.isAuthenticated(),
+            wellfoundCsrfConfigured: Boolean((env.WELLFOUND_CSRF_TOKEN || '').trim()),
           },
           capabilities: { tools: { listChanged: false } },
           tools: WELLFOUND_TOOLS.map((t) => t.name),
@@ -464,7 +691,6 @@ export default {
       );
     }
 
-    // JSON-RPC 2.0 MCP Handler
     if (request.method === 'POST') {
       let body: any;
       try {
@@ -487,7 +713,7 @@ export default {
               result: {
                 protocolVersion: '2024-11-05',
                 capabilities: { tools: { listChanged: false } },
-                serverInfo: { name: 'wellfound-mcp-worker', version: '1.0.0' },
+                serverInfo: { name: 'wellfound-mcp-worker', version: '1.1.0' },
               },
             },
             { headers: CORS_HEADERS }
@@ -519,19 +745,39 @@ export default {
               resultData = await client.searchJobs(args);
               break;
             case 'get_wellfound_job_details':
-              if (!args.job_slug) {
-                throw new Error('job_slug is required');
-              }
+              if (!args.job_slug) throw new Error('job_slug is required');
               resultData = await client.getJobDetails(String(args.job_slug));
               break;
             case 'get_wellfound_company':
-              if (!args.company_slug) {
-                throw new Error('company_slug is required');
-              }
+              if (!args.company_slug) throw new Error('company_slug is required');
               resultData = await client.getCompany(String(args.company_slug));
               break;
             case 'list_wellfound_applications':
               resultData = await client.listApplications(Number(args.page) || 1);
+              break;
+            case 'apply_to_wellfound_job':
+              if (!args.note) throw new Error('note (cover pitch) is required');
+              resultData = await client.applyToJob({
+                job_id: args.job_id,
+                job_slug: args.job_slug,
+                note: String(args.note),
+                answers: args.answers,
+                dry_run: Boolean(args.dry_run),
+              });
+              break;
+            case 'save_wellfound_job':
+              if (!args.job_id) throw new Error('job_id is required');
+              resultData = await client.saveJob(String(args.job_id), args.saved !== false);
+              break;
+            case 'send_wellfound_message':
+              if (!args.thread_id || !args.body) throw new Error('thread_id and body are required');
+              resultData = await client.sendMessage(String(args.thread_id), String(args.body));
+              break;
+            case 'update_wellfound_profile_headline':
+              resultData = await client.updateProfileHeadline({
+                headline: args.headline,
+                job_search_status: args.job_search_status,
+              });
               break;
             default:
               return Response.json(
