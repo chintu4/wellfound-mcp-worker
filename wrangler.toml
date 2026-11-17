@@ -1,0 +1,6 @@
+name = "wellfound-mcp-worker"
+main = "src/index.ts"
+compatibility_date = "2026-11-17"
+
+[vars]
+WELLFOUND_BASE_URL = "https://wellfound.com"
